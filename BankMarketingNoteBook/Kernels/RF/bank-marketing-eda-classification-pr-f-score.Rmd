@@ -1,0 +1,2038 @@
+---
+title: "Bank Marketing - EDA + Classification Algorithms + PR Curve + F1 Score"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center")
+```
+
+# Introduction
+
+This dataset is based on "Bank Marketing" UCI dataset (please check the description at: http://archive.ics.uci.edu/ml/datasets/Bank+Marketing). The data is enriched by the addition of five new social and economic features/attributes (national wide indicators from a ~10M population country), published by the Banco de Portugal and publicly available at: https://www.bportugal.pt/estatisticasweb. This dataset is almost identical to the one used in [Moro et al., 2014] (it does not include all attributes due to privacy concerns). 
+
+The data is related with direct marketing campaigns of a Portuguese banking institution. The marketing campaigns were based on phone calls. Often, more than one contact to the same client was required, in order to access if the product (bank term deposit) would be ('yes') or not ('no') subscribed. The classification goal is to predict if the client will subscribe a term deposit (variable y).
+
+## Dataset
+
+### Available features
+
+**Bank client data:**
+
+* Age (numeric)
+* Job : type of job (categorical: 'admin.', 'blue-collar', 'entrepreneur', 'housemaid', 'management', 'retired', 'self-employed', 'services', 'student', 'technician', 'unemployed', 'unknown')
+* Marital : marital status (categorical: 'divorced', 'married', 'single', 'unknown' ; note: 'divorced' means divorced or widowed)
+* Education (categorical: 'basic.4y', 'basic.6y', 'basic.9y', 'high.school', 'illiterate', 'professional.course', 'university.degree', 'unknown')
+* Default: has credit in default? (categorical: 'no', 'yes', 'unknown')
+* Housing: has housing loan? (categorical: 'no', 'yes', 'unknown')
+* Loan: has personal loan? (categorical: 'no', 'yes', 'unknown')
+
+**Related with the last contact of the current campaign:**
+
+* Contact: contact communication type (categorical: 'cellular','telephone')
+* Month: last contact month of year (categorical: 'jan', 'feb', 'mar', ..., 'nov', 'dec')
+* Day_of_week: last contact day of the week (categorical: 'mon','tue','wed','thu','fri')
+* Duration: last contact duration, in seconds (numeric). Important note: this attribute highly affects the output target (e.g., if duration=0 then y='no'). Yet, the duration is not known before a call is performed. Also, after the end of the call y is obviously known. Thus, this input should only be included for benchmark purposes and should be discarded if the intention is to have a realistic predictive model.
+
+**Other attributes:**
+
+* Campaign: number of contacts performed during this campaign and for this client (numeric, includes last contact)
+* Pdays: number of days that passed by after the client was last contacted from a previous campaign (numeric; 999 means client was not previously contacted)
+* Previous: number of contacts performed before this campaign and for this client (numeric)
+* Poutcome: outcome of the previous marketing campaign (categorical: 'failure','nonexistent','success')
+
+**Social and economic context attributes:**
+
+* Emp.var.rate: employment variation rate - quarterly indicator (numeric)
+* Cons.price.idx: consumer price index - monthly indicator (numeric)
+* Cons.conf.idx: consumer confidence index - monthly indicator (numeric)
+* Euribor3m: euribor 3 month rate - daily indicator (numeric)
+* Nr.employed: number of employees - quarterly indicator (numeric)
+
+**Output variable (desired target):**
+
+* y: has the client subscribed a term deposit? (binary: 'yes', 'no')
+
+
+### First insight
+
+#### Loading packages ...
+
+```{r, message=F}
+library(gmodels) # Cross Tables [CrossTable()]
+library(ggmosaic) # Mosaic plot with ggplot [geom_mosaic()]
+library(corrplot) # Correlation plot [corrplot()]
+library(ggpubr) # Arranging ggplots together [ggarrange()]
+library(cowplot) # Arranging ggplots together [plot_grid()]
+library(caret) # ML [train(), confusionMatrix(), createDataPartition(), varImp(), trainControl()]
+library(ROCR) # Model performance [performance(), prediction()]
+library(plotROC) # ROC Curve with ggplot [geom_roc()]
+library(pROC) # AUC computation [auc()]
+library(PRROC) # AUPR computation [pr.curve()]
+library(rpart) # Decision trees [rpart(), plotcp(), prune()]
+library(rpart.plot) # Decision trees plotting [rpart.plot()]
+library(ranger) # Optimized Random Forest [ranger()]
+library(lightgbm) # Light GBM [lgb.train()]
+library(xgboost) # XGBoost [xgb.DMatrix(), xgb.train()]
+library(MLmetrics) # Custom metrics (F1 score for example)
+library(tidyverse) # Data manipulation
+library(doMC) # Parallel processing
+registerDoMC(cores = 10)
+```
+
+
+#### Dataset importation
+
+```{r}
+bank_data = read.csv(file = "../input/bank-additional-full.csv",
+                     sep = ";",
+                     stringsAsFactors = F)
+```
+
+```{r}
+dim(bank_data)
+```
+
+The dataset has 41,188 rows and 21 columns.
+
+```{r}
+names(bank_data)
+```
+
+The first 20 variables are our potential explanatory variables and the last one ("y") is the dependent variable.
+
+```{r}
+CrossTable(bank_data$y)
+```
+
+This is an unbalanced two-levels categorical variable, 88.7% of values taken are "no" (or "0") and only 11.3% of the values are "yes" (or "1"). It is more natural to work with a 0/1 dependent variable:
+
+```{r}
+bank_data = bank_data %>% 
+  mutate(y = factor(if_else(y == "yes", "1", "0"), 
+                    levels = c("0", "1")))
+```
+
+
+```{r}
+head(bank_data)
+```
+
+```{r}
+sum(is.na(bank_data))
+```
+
+There's no missing value in the dataset. However, according to the data documentation, "unknown" value means NA.
+
+```{r}
+sum(bank_data == "unknown")
+```
+
+There are 12,718 unknown values in the dataset, let's try to find out which variables suffer the most from those "missing values".
+
+```{r}
+bank_data %>% 
+  summarise_all(list(~sum(. == "unknown"))) %>% 
+  gather(key = "variable", value = "nr_unknown") %>% 
+  arrange(-nr_unknown)
+```
+
+6 features have at least 1 unknown value. Before deciding how to manage those missing values, we'll study each variable and take a decision after visualisations. We can't afford to delete 8,597 rows in our dataset, it's more than 20% of our observations.
+
+Those are a few functions that will be useful later. Sorry for this long code chunk.
+
+```{r}
+# default theme for ggplot
+theme_set(theme_bw())
+
+# setting default parameters for mosaic plots
+mosaic_theme = theme(axis.text.x = element_text(angle = 90,
+                                                hjust = 1,
+                                                vjust = 0.5),
+                     axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank())
+
+# setting default parameters for crosstables
+fun_crosstable = function(df, var1, var2){
+  # df: dataframe containing both columns to cross
+  # var1, var2: columns to cross together.
+  CrossTable(df[, var1], df[, var2],
+             prop.r = T,
+             prop.c = F,
+             prop.t = F,
+             prop.chisq = F,
+             dnn = c(var1, var2))
+}
+
+# plot weighted lm/leoss regressions with frequencies
+fun_gg_freq = function(var){
+  # var: which column from bank_data to use in regressions
+  
+  # computing weights first...
+  weight = table(bank_data[, var]) %>% 
+    as.data.frame %>% 
+    mutate(x = as.numeric(as.character(Var1))) %>% 
+    select(-Var1) %>% 
+    rename(weight = Freq)
+  
+  # ... then frequencies
+  sink(tempfile())
+  freq = fun_crosstable(bank_data, var, "y")$prop.r %>% 
+    as.data.frame %>% 
+    mutate(x = as.numeric(as.character(x)))
+  sink()
+  
+  # assembling
+  both = freq %>% 
+    left_join(weight, by = "x") %>% 
+    filter(weight > 50 & y == 1)
+  
+  # plotting
+  gg = both %>% 
+    ggplot() +
+    aes(x = x,
+        y = Freq,
+        weight = weight) +
+    geom_point(aes(size = weight)) +
+    geom_smooth(aes(colour = "blue"), method = "loess") +
+    geom_smooth(aes(colour = "red"), method = "lm", se = F) +
+    coord_cartesian(ylim = c(-0.1, 1)) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "pt")) +
+    xlab(var) +
+    ylab("") +
+    scale_x_continuous(position = "top") +
+    scale_colour_manual(values = c("blue", "red"),
+                        labels = c("loess", "lm")) +
+    labs(colour = "Regression")
+  
+  return(gg)
+}
+
+# re-ordering levels from factor variable
+fun_reorder_levels = function(df, variable, first){
+  # df: dataframe containing columns to transform into factors
+  # variable: variable to transform into factor
+  # first: first level of the variable to transform.
+  
+  remaining = unique(df[, variable])[which(unique(df[, variable]) != first)]
+  x = factor(df[, variable], levels = c(first, remaining))
+  return(x)
+}
+
+# plotting importance from predictive models into two panels
+fun_imp_ggplot_split = function(model){
+  # model: model used to plot variable importances
+  
+  if (class(model)[1] == "ranger"){
+    imp_df = model$variable.importance %>% 
+      data.frame("Overall" = .) %>% 
+      rownames_to_column() %>% 
+      rename(variable = rowname) %>% 
+      arrange(-Overall)
+  } else {
+    imp_df = varImp(model) %>%
+      rownames_to_column() %>% 
+      rename(variable = rowname) %>% 
+      arrange(-Overall)
+  }
+  
+  # first panel (half most important variables)
+  gg1 = imp_df %>% 
+    slice(1:floor(nrow(.)/2)) %>% 
+    ggplot() +
+    aes(x = reorder(variable, Overall), weight = Overall, fill = -Overall) +
+    geom_bar() +
+    coord_flip() +
+    xlab("Variables") +
+    ylab("Importance") +
+    theme(legend.position = "none")
+  
+  imp_range = ggplot_build(gg1)[["layout"]][["panel_params"]][[1]][["x.range"]]
+  imp_gradient = scale_fill_gradient(limits = c(-imp_range[2], -imp_range[1]),
+                                     low = "#132B43", 
+                                     high = "#56B1F7")
+  
+  # second panel (less important variables)
+  gg2 = imp_df %>% 
+    slice(floor(nrow(.)/2)+1:nrow(.)) %>% 
+    ggplot() +
+    aes(x = reorder(variable, Overall), weight = Overall, fill = -Overall) +
+    geom_bar() +
+    coord_flip() +
+    xlab("") +
+    ylab("Importance") +
+    theme(legend.position = "none") +
+    ylim(imp_range) +
+    imp_gradient
+  
+  # arranging together
+  gg_both = plot_grid(gg1 + imp_gradient,
+                      gg2)
+  
+  return(gg_both)
+}
+
+# plotting two performance measures
+fun_gg_cutoff = function(score, obs, measure1, measure2) {
+  # score: predicted scores
+  # obs: real classes
+  # measure1, measure2: which performance metrics to plot
+  
+  predictions = prediction(score, obs)
+  performance1 = performance(predictions, measure1)
+  performance2 = performance(predictions, measure2)
+  
+  df1 = data.frame(x = performance1@x.values[[1]],
+                   y = performance1@y.values[[1]],
+                   measure = measure1,
+                   stringsAsFactors = F) %>% 
+    drop_na()
+  df2 = data.frame(x = performance2@x.values[[1]],
+                   y = performance2@y.values[[1]],
+                   measure = measure2,
+                   stringsAsFactors = F) %>% 
+    drop_na()
+  
+  # df contains all the data needed to plot both curves
+  df = df1 %>% 
+    bind_rows(df2)
+  
+  # extracting best cut for each measure
+  y_max_measure1 = max(df1$y, na.rm = T)
+  x_max_measure1 = df1[df1$y == y_max_measure1, "x"][1]
+  
+  y_max_measure2 = max(df2$y, na.rm = T)
+  x_max_measure2 = df2[df2$y == y_max_measure2, "x"][1]
+  
+  txt_measure1 = paste("Best cut for", measure1, ": x =", round(x_max_measure1, 3))
+  txt_measure2 = paste("Best cut for", measure2, ": x =", round(x_max_measure2, 3))
+  txt_tot = paste(txt_measure1, "\n", txt_measure2, sep = "")
+  
+  # plotting both measures in the same plot, with some detail around.
+  gg = df %>% 
+    ggplot() +
+    aes(x = x,
+        y = y,
+        colour = measure) +
+    geom_line() +
+    geom_vline(xintercept = c(x_max_measure1, x_max_measure2), linetype = "dashed", color = "gray") +
+    geom_hline(yintercept = c(y_max_measure1, y_max_measure2), linetype = "dashed", color = "gray") +
+    labs(caption = txt_tot) +
+    theme(plot.caption = element_text(hjust = 0)) +
+    xlim(c(0, 1)) +
+    ylab("") +
+    xlab("Threshold")
+  
+  return(gg)
+}
+
+# creating classes according to score and cut
+fun_cut_predict = function(score, cut) {
+  # score: predicted scores
+  # cut: threshold for classification
+  
+  classes = score
+  classes[classes > cut] = 1
+  classes[classes <= cut] = 0
+  classes = as.factor(classes)
+  
+  return(classes)  
+}
+
+# computing AUPR
+aucpr = function(obs, score){
+  # obs: real classes
+  # score: predicted scores
+  
+  df = data.frame("pred" = score,
+                  "obs" = obs)
+  
+  prc = pr.curve(df[df$obs == 1, ]$pred,
+                 df[df$obs == 0, ]$pred)
+  
+  return(prc$auc.davis.goadrich)
+}
+
+# plotting PR curve
+gg_prcurve = function(df) {
+  # df: df containing models scores by columns and the last column must be
+  #     nammed "obs" and must contain real classes.
+  
+  # init
+  df_gg = data.frame("v1" = numeric(), 
+                     "v2" = numeric(), 
+                     "v3" = numeric(), 
+                     "model" = character(),
+                     stringsAsFactors = F)
+  
+  # individual pr curves
+  for (i in c(1:(ncol(df)-1))) {
+    x1 = df[df$obs == 1, i]
+    x2 = df[df$obs == 0, i]
+    prc = pr.curve(x1, x2, curve = T)
+    
+    df_prc = as.data.frame(prc$curve, stringsAsFactors = F) %>% 
+      mutate(model = colnames(df)[i])
+    
+    # combining pr curves
+    df_gg = bind_rows(df_gg,
+                      df_prc)
+    
+  }
+  
+  gg = df_gg %>% 
+    ggplot() +
+    aes(x = V1, y = V2, colour = model) +
+    geom_line() +
+    xlab("Recall") +
+    ylab("Precision")
+  
+  return(gg)
+}
+```
+
+
+
+## Exploratory Analysis and Feature Engineering
+
+### Univariate analysis
+
+Each feature will be checked one at a time. We'll eventually drop or transform some variables in order to clean up our dataset a little bit.
+
+#### Age
+
+What kind of persons were contacted during this marketing campaign?
+
+
+```{r}
+summary(bank_data$age)
+```
+
+Ages range from 17 to 98, there doesn't seem anything strange from there. The other summary statistics are fine, the average is 40 years old.
+
+```{r}
+bank_data %>% 
+  ggplot() +
+  aes(x = age) +
+  geom_bar() +
+  geom_vline(xintercept = c(30, 60), 
+             col = "red",
+             linetype = "dashed") +
+  facet_grid(y ~ .,
+             scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 100, 5))
+```
+
+First of all, the banks are not very much interested by contacting the older population. Even though, after the 60-years threshold, the relative frequency is higher when y = 1. In other words, we can say that elderly persons are more likely to subscribe to a term deposit.
+
+```{r}
+bank_data %>% 
+  mutate(elder60 = if_else(age > 60, "1", "0")) %>% 
+  group_by(y) %>% 
+  add_count(nr_y = n()) %>% 
+  group_by(elder60, y) %>% 
+  summarise(abs_freq = n(),
+            relative_freq = round(100*n()/first(nr_y), 2))
+```
+
+Elderly persons represent 8.92% of observations who accepted to subscribe to a term deposit, this proportion decreases to 1.36% for non subscribers.
+
+We can also slice the age feature at 30 years to make three easily interpretable classes : [0, 30[, [30, 60[ and [60, +Inf[. The minimum and maximum values are 17 and 98 but we can expect new observations outside this range. We're replacing the continious variable "age" by this categorical variable.
+
+We might lose some information from this continious-to-discrete transformation, but there wasn't any clear pattern between years. Cutting into classes make the algorithms easier to interpret later.
+
+```{r}
+bank_data = bank_data %>% 
+  mutate(age = if_else(age > 60, "high", if_else(age > 30, "mid", "low")))
+```
+
+Let's cross it with our dependent variable.
+
+```{r}
+fun_crosstable(bank_data, "age", "y")
+```
+
+45.5% of people over 60 years old subscribed a term deposit, which is a lot in comparison with younger individuals (15.2% for young adults (aged lower than 30) and only 9.4% for the remaining observations (aged between 30 and 60)).
+
+
+
+#### Job
+
+What kind of jobs are represented by our clients pool?
+
+```{r}
+table(bank_data$job)
+```
+
+There are mainly admin. (white-collars?) and blue-collars in the dataset. We can notice 330 "unknown" values.
+
+```{r}
+fun_crosstable(bank_data, "job", "y")
+```
+
+The "unknown" level doesn't show any important information and should be discarded from the data. We'll remove rows containing this value in the "job" column.
+
+```{r}
+bank_data = bank_data %>% 
+  filter(job != "unknown")
+```
+
+```{r}
+bank_data %>% 
+  ggplot() +
+  geom_mosaic(aes(x = product(y, job), fill = y)) +
+  mosaic_theme +
+  xlab("Job") +
+  ylab(NULL)
+```
+
+Surprisingly, students (31.4%), retired people (25.2%) and unemployed (14.2%) categories show the best relative frequencies of term deposit subscription. Other classes range between 6.9% (blue-collar) and 13.0% (admin.).
+
+
+#### Marital situation
+
+How's the marital situation of the clients?
+
+```{r}
+fun_crosstable(bank_data, "marital", "y")
+```
+
+For the same reasons as before, we'll remove rows with "unknown" as value for this variable.
+
+```{r}
+bank_data = bank_data %>% 
+  filter(marital != "unknown")
+```
+
+Celibates slightly subscribe more often (14.0%) to term deposits than others (divorced (10.3%) and married (10.2%)).
+
+```{r}
+bank_data %>% 
+  ggplot() +
+  geom_mosaic(aes(x = product(y, marital), fill = y)) +
+  mosaic_theme +
+  xlab("Marital status") +
+  ylab(NULL)
+```
+
+
+
+#### Education
+
+How educated are our clients?
+
+```{r}
+fun_crosstable(bank_data, "education", "y")
+```
+
+The illiterate category has not enough observations to be statisticaly meaningful. We can't discriminate illiterate people by using a pool made of 18 individuals only. Hence, those rows will be deleted from the dataset.
+
+```{r}
+bank_data = bank_data %>% 
+  filter(education != "illiterate")
+```
+
+
+Among the 1,596 rows containing the "unknown" value, 234 of them subscribed to a term deposit. This is around 5% of the total group of subscribers. Since we're facing a very unbalanced dependent variable situation, we can not afford to discard those rows. Because this category has the highest relative frequency of "y = 1" (14.7%), we're going to add them in the "university.degree" level. It has the second highest "y = 1" relative frequency (13.7%).
+
+```{r}
+bank_data = bank_data %>% 
+  mutate(education = recode(education, "unknown" = "university.degree"))
+```
+
+```{r}
+bank_data %>% 
+  ggplot() +
+  geom_mosaic(aes(x = product(y, education), fill = y)) +
+  mosaic_theme +
+  xlab("Education") +
+  ylab(NULL)
+```
+
+It appears that a positive correlation between the number of years of education and the odds to subscribe to a term deposit exists.
+
+
+
+#### Default
+
+Does the client have a credit in default?
+
+```{r}
+fun_crosstable(bank_data, "default", "y")
+```
+
+This feature is certainly not usable. Only 3 individuals replied "yes" to the question "Do you have credit in default?". People either answered "no" (79.3%) or don't even reply (20.7%), which gives zero information in our case. This variable is removed from the dataset.
+
+```{r}
+bank_data = bank_data %>% 
+  select(-default)
+```
+
+
+#### Housing
+
+Does the client have a housing loan?
+
+```{r}
+fun_crosstable(bank_data, "housing", "y")
+```
+
+```{r}
+chisq.test(bank_data$housing, bank_data$y)
+```
+
+The p-value associated to the Chi-squared test equals to 0.065, which is higher than a 0.05-threshold. So, for a confidence level of 95%, there's no association between the dependent variable y and our feature housing. We're removing it from the dataset.
+
+```{r}
+bank_data = bank_data %>% 
+  select(-housing)
+```
+
+
+
+#### Loan
+
+Does the client have a personal loan?
+
+```{r}
+fun_crosstable(bank_data, "loan", "y")
+```
+
+```{r}
+chisq.test(bank_data$loan, bank_data$y)
+```
+
+The p-value associated to the Chi-squared test equals to 0.648, which is higher than a 0.01-threshold. So, for a confidence level of 99%, there's no association between the dependent variable y and our feature loan. We're also removing it from the dataset.
+
+```{r}
+bank_data = bank_data %>% 
+  select(-loan)
+```
+
+For information, there doesn't seems to be any useful interaction with loan and housing features with the other ones.
+
+#### Contact
+
+How was the client contacted?
+
+```{r}
+fun_crosstable(bank_data, "contact", "y")
+```
+
+This feature is really interesting, 14.7% of cellular responders subscribed to a term deposit while only 5.2% of telephone responders did.
+
+
+#### Month
+
+Recoding levels makes things easier.
+
+```{r}
+month_recode = c("jan" = "(01)jan",
+                 "feb" = "(02)feb",
+                 "mar" = "(03)mar",
+                 "apr" = "(04)apr",
+                 "may" = "(05)may",
+                 "jun" = "(06)jun",
+                 "jul" = "(07)jul",
+                 "aug" = "(08)aug",
+                 "sep" = "(09)sep",
+                 "oct" = "(10)oct",
+                 "nov" = "(11)nov",
+                 "dec" = "(12)dec")
+
+bank_data = bank_data %>% 
+  mutate(month = recode(month, !!!month_recode))
+```
+
+```{r}
+fun_crosstable(bank_data, "month", "y")
+```
+
+```{r}
+bank_data %>% 
+  ggplot() +
+  aes(x = month, y = ..count../nrow(bank_data), fill = y) +
+  geom_bar() +
+  ylab("relative frequency")
+```
+
+First of all, we can notice that no contact has been made during January and February. The highest spike occurs during May, with 33.4% of total contacts, but it has the worst ratio of subscribers over persons contacted (6.5%). Every month with a very low frequency of contact (march, september, october and december) shows very good results (between 44% and 51% of subscribers). December aside, there are enough observations to conclude this isn't pure luck, so this feature will probably be very important in models.
+
+
+#### Day of the week
+
+For the same reason as before, we're recoding the days of the week.
+
+```{r}
+day_recode = c("mon" = "(01)mon",
+               "tue" = "(02)tue",
+               "wed" = "(03)wed",
+               "thu" = "(04)thu",
+               "fri" = "(05)fri")
+
+bank_data = bank_data %>% 
+  mutate(day_of_week = recode(day_of_week, !!!day_recode))
+```
+
+```{r}
+fun_crosstable(bank_data, "day_of_week", "y")
+```
+
+Calls aren't made during weekend days. If calls are evenly distributed between the different week days, Thursdays tend to show better results (12.1% of subscribers among calls made this day) unlike Mondays with only 10.0% of successful calls. However, those differences are small, which makes this feature not that important. It would've been interesting to see the attitude of responders from weekend calls.
+
+
+#### Duration
+
+Since the goal is to seek best candidates who will have the best odds to subscribe to a term deposit, the call duration can't be known before. So this feature is removed as recommended.
+
+```{r}
+bank_data = bank_data %>% 
+  select(-duration)
+```
+
+
+#### Campaign
+
+How many times was the client contacted during this campaign?
+
+```{r}
+bank_data %>% 
+  ggplot() +
+  aes(x = campaign) +
+  geom_bar() +
+  facet_grid(y ~ .,
+             scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 50, 5))
+```
+
+Calling more than ten times a same person during a single marketing campaign seems excessive. We'll consider those as outliers, even if marketing harrassment a real thing. However, we can see that on the chart that harassment isn't working at all.
+
+```{r}
+bank_data = bank_data %>% 
+  filter(campaign <= 10)
+```
+
+
+```{r}
+bank_data %>% 
+  ggplot() +
+  aes(x = campaign) +
+  geom_bar() +
+  facet_grid(y ~ .,
+             scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 10, 1))
+```
+
+```{r}
+fun_crosstable(bank_data, "campaign", "y")
+```
+
+Let's extract the row proportions when y = 1.
+
+```{r, echo = F}
+prop_row = fun_crosstable(bank_data, "campaign", "y")$prop.row %>% 
+  as.data.frame() %>% 
+  filter(y == 1)
+```
+
+```{r}
+prop_row %>% 
+  ggplot() +
+  aes(x = x,
+      y = Freq) +
+  geom_point() +
+  geom_hline(yintercept = 0.085, 
+             col = "red")
+```
+
+There's a linear pattern depending the different values of Campaign. We'll lose a lot of information if we're binning this variable. Hence, it'll kept as a categorical variable with 10 levels.
+
+```{r}
+bank_data = bank_data %>% 
+  mutate(campaign = as.character(campaign))
+```
+
+All the variables are kept as character or numeric for now, we'll change them to factors if needed later.
+
+
+
+#### Pdays
+
+If the client has already been contacted in a previous campaign, how many days passed meanwhile?
+
+```{r}
+table(bank_data$pdays)
+```
+
+This is the number of days that passed by after the client was last contacted from a previous campaign. 999 value means the client wasn't previously contacted. Let's make a dummy out of it.
+
+Clients who haven't been contacted in a previous campaign will be labeled "0" in the pdays_dummy variable.
+
+```{r}
+bank_data = bank_data %>% 
+  mutate(pdays_dummy = if_else(pdays == 999, "0", "1")) %>% 
+  select(-pdays)
+```
+
+```{r}
+fun_crosstable(bank_data, "pdays_dummy", "y")
+```
+
+Recontacting a client after a previous campaign seems to highly increase the odds of subscription.
+
+
+#### Previous
+
+```{r}
+table(bank_data$previous)
+```
+
+This is the number of contacts performed before this campaign and for each client.
+
+```{r}
+bank_data %>% 
+  ggplot() +
+  geom_mosaic(aes(x = product(previous), fill = y)) +
+  mosaic_theme +
+  xlab("Previous") +
+  ylab(NULL)
+```
+
+If we make a dummy out of this, depending if the client has been contacted in a previous compaign (1, 2, ...) or not (0), this variable will exactly have the same information than pdays_dummy. We can't keep this variable without binning modalities because some levels show way not enough observations. The best we can do is to make 3 levels out of this.
+
+```{r}
+bank_data = bank_data %>% 
+  mutate(previous = if_else(previous >=  2, "2+", if_else(previous == 1, "1", "0")))
+```
+
+This variable will still be highly correlated to pdays_dummy, because someone can be contacted more than once in a same compaign. It won't be surprising if we'll have to drop one of those variables.
+
+```{r}
+fun_crosstable(bank_data, "previous", "y")
+```
+
+As the analysis of the pdays_dummy variable has shown, recontacting someone again will increase the odds. Can we say that long term harassment works unlike short term harassment?
+
+
+
+#### Poutcome
+
+```{r}
+fun_crosstable(bank_data, "poutcome", "y")
+```
+
+65.6% of people who already subscribed to a term deposit after a previous contact have accepted to do it again. Even if they denied before, they're still more enthusiastic to accept it (14.1%) than people who haven't been contacted before (9.0%). So even if the previous campaign was a failure, recontacting people is important.
+
+<hr>
+
+So far, the social and economic context attributes are remaining. Since those indicators are highly correlated together, we'll study those by pairs (bivariate study).
+
+### Bivariate analysis
+
+#### Employment variation rate, Consumer price index, Consumer confidence index, Euribor 3 months rate, Number of employees
+
+Those five continious variables are social and economic indicators. They're supposed to be highly correlated. Let's compute the correlation matrix.
+
+```{r}
+bank_data %>% 
+  select(emp.var.rate, cons.price.idx, cons.conf.idx, euribor3m, nr.employed) %>% 
+  cor() %>% 
+  corrplot(method = "number",
+           type = "upper",
+           tl.cex = 0.8,
+           tl.srt = 45,
+           tl.col = "black")
+```
+
+As expected, three pairs show a correlation coefficient higher than 0.90 which is way too much. Our indicators are too correlated and share redundant information. Let's figure out which variable(s) should be removed to lighten this correlation matrix.
+
+The following chart shows the evolution of "y = 1" frequencies according to each social and economic variable.
+
+```{r, warning = F}
+gg_emp.var.rate = fun_gg_freq("emp.var.rate")
+gg_cons.price.idx = fun_gg_freq("cons.price.idx")
+gg_cons.conf.idx = fun_gg_freq("cons.conf.idx")
+gg_euribor3m = fun_gg_freq("euribor3m")
+gg_nr.employed = fun_gg_freq("nr.employed")
+
+plot_grid(gg_emp.var.rate + theme(legend.position = "none") + ylab("Frequency"), 
+          gg_cons.price.idx + theme(legend.position = "none"),
+          gg_cons.conf.idx + theme(legend.position = "none"),
+          gg_euribor3m + theme(legend.position = "none"),
+          gg_nr.employed + theme(legend.position = "none"),
+          get_legend(gg_cons.conf.idx),
+          align = "vh")
+
+```
+
+emp.var.rate isn't meaningful. We're removing it to soften correlations between those 5 variables.
+
+```{r}
+bank_data = bank_data %>% 
+  select(-emp.var.rate)
+```
+
+
+```{r}
+bank_data %>% 
+  select(cons.price.idx, cons.conf.idx, euribor3m, nr.employed) %>% 
+  cor() %>% 
+  corrplot(method = "number",
+           type = "full",
+           tl.cex = 0.8,
+           tl.srt = 45,
+           tl.col = "black")
+```
+
+Even if there's still a high correlation between two variables : euribor3m and nr.employed (0.94), we're keeping both features. This is probably a spurious correlation, bank size (number of employees) isn't reactive to the euribor rate.
+
+
+
+Let's continue the bivariate analysis by crossing our features with our predicted variable.
+
+First, we'll split character features and non-character features (numeric or factor) to use appropriate tests (anova for numeric features and chi squared test (through the Cramer's V coefficient) for discrete variables).
+
+```{r}
+bank_data_x_dbl = bank_data %>%
+  select_if(~{is.double(.) | is.factor(.)})
+
+bank_data_x_chr = bank_data %>%
+  select_if(~is.character(.))
+```
+
+Let's start with some anova.
+
+```{r}
+summary(aov(cons.price.idx ~ y,
+            data = bank_data_x_dbl))
+summary(aov(cons.conf.idx ~ y,
+            data = bank_data_x_dbl))
+summary(aov(euribor3m ~ y,
+            data = bank_data_x_dbl))
+summary(aov(nr.employed ~ y,
+            data = bank_data_x_dbl))
+```
+
+All four remaining variables have their values statisticaly contrasted by the y response. This is good.
+
+#### Cramer's V against y (3 columns)
+
+The Cramer's V is the standardized value of the chi-squared test statistic and is calculated as follows:
+$$V = \sqrt{\frac{\chi^2}{n \cdot (\min (r, c) -1)}}$$
+whereby $n$ is the size of the sample, $r$ is the number of rows in our contingency table and $c$ is the number of columns. Since one of the two inputs of the contingency table is our predicted variable, which has only two levels, $\min (r,c) - 1$ is neccessarily equal to 1. So the formula is simply (in this case):
+
+$$V = \sqrt{\frac{\chi^2}{n}}$$
+```{r include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, rows.print=25)
+```
+
+
+```{r}
+cramer = data.frame(NA, ncol(bank_data_x_chr), 3)
+
+for (i in (1:ncol(bank_data_x_chr))){
+  tab = table(bank_data_x_chr[, i], bank_data$y)
+  chisq_results = chisq.test(tab)
+  cramer[i, 1] = names(bank_data_x_chr)[i]
+  cramer[i, 2] = round(sqrt(chisq_results$statistic/(nrow(bank_data_x_chr))), 3)
+  cramer[i, 3] = signif(chisq_results$p.value, 3)
+}
+colnames(cramer) = c("variable", "cramerv", "pvalue_chi2")
+cramer
+```
+
+
+
+```{r}
+cramer %>% 
+  arrange(-cramerv) %>% 
+  ggplot() +
+  aes(x = reorder(variable, -cramerv),
+      y = cramerv,
+      fill = -cramerv) +
+  geom_bar(stat = "identity",
+           show.legend = F) +
+  xlab("Variable") +
+  ylab("Cramer's V") +
+  ggtitle("Cramer's V against the explained response") +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1)) +
+  scale_fill_gradient(high = "pink",
+                      low = "darkred")
+```
+
+High V value means an important dependancy between the feature and the y variable.
+
+
+
+#### Cramer's V matrix among features
+
+This time, input can both have more than two levels, so the default formula is used:
+$$V = \sqrt{\frac{\chi^2}{n \cdot (\min (r, c) -1)}}$$
+
+```{r, warning=F, message=F}
+cramer = matrix(NA, ncol(bank_data_x_chr), ncol(bank_data_x_chr))
+
+for (i in (1:ncol(bank_data_x_chr))){
+  for (j in (1:ncol(bank_data_x_chr))){
+    tab = table(bank_data_x_chr[, i], bank_data_x_chr[, j])
+    chisq_results = chisq.test(tab)
+    cramer[i, j] = sqrt(chisq_results$statistic/(nrow(bank_data_x_chr) * (min(dim(tab)) -1)))
+  }
+}
+
+cramer = round(cramer, 3)
+colnames(cramer) = colnames(bank_data_x_chr)
+rownames(cramer) = colnames(bank_data_x_chr)
+```
+
+
+```{r}
+corrplot(cramer,
+         method = "shade",
+         type = "upper",
+         diag = F,
+         tl.srt = 45, 
+         tl.col = "black",
+         tl.cex = 0.6, 
+         addCoef.col = "darkgreen", 
+         addCoefasPercent = T)
+```
+
+Except of the pdays_dummy and poutcome variables, the standardized chi squared statistic isn't showing important dependecy between features. We're arbitrarily keeping every variable.
+
+<hr>
+
+So far, we've :
+
+* removed four variables : default (lack of variability), housing (lack of information), loan (lack of information) and emp.var.rate (lack of significience),
+* binned two variables : pdays and previous,
+* framed one variable : campaign because it had outliers,
+* detected but kept two correlation issues : nr.employed with euribor3m and poutcome with pdays_dummy.
+
+<hr>
+
+The data exploration ends here, let's process to machine learning models.
+
+
+
+
+# Predictive models
+
+## Data preparation
+
+Now we've selected our features, it is useful to transform every character variable to factor variables for interpretation purposes for the logistic regressions. This function also picks the reference value for comparisons (reference group).
+
+```{r}
+bank_data$age = fun_reorder_levels(bank_data, "age", "low")
+bank_data$job = fun_reorder_levels(bank_data, "job", "unemployed")
+bank_data$marital = fun_reorder_levels(bank_data, "marital", "single")
+bank_data$education = fun_reorder_levels(bank_data, "education", "basic.4y")
+bank_data$contact = fun_reorder_levels(bank_data, "contact", "telephone")
+bank_data$month = fun_reorder_levels(bank_data, "month", "(03)mar")
+bank_data$day_of_week = fun_reorder_levels(bank_data, "day_of_week", "(01)mon")
+bank_data$campaign = fun_reorder_levels(bank_data, "campaign", "1")
+bank_data$previous = fun_reorder_levels(bank_data, "previous", "0")
+bank_data$poutcome = fun_reorder_levels(bank_data, "poutcome", "nonexistent")
+bank_data$pdays_dummy = fun_reorder_levels(bank_data, "pdays_dummy", "0")
+```
+
+```{r}
+glimpse(bank_data)
+```
+
+Our dataset is ready, the only remaining step is to split our data into training and validation sets. The sampling will be made with the `caret` package. We're using a 80%/20% split here.
+
+```{r}
+set.seed(1234)
+
+ind = createDataPartition(bank_data$y,
+                          times = 1,
+                          p = 0.8,
+                          list = F)
+bank_train = bank_data[ind, ]
+bank_test = bank_data[-ind, ]
+```
+
+`bank_train` will be our training set while `bank_test` will be used to validate our models.
+
+Let's start out with logistic regressions, decision trees, random forests (through the `ranger` package), then boosting (Extreme GBM then Light GBM).
+
+
+
+## Logistic regression
+
+The first model is a logistic regression, with every remaining features.
+
+```{r}
+logistic = glm(y ~ .,
+               data = bank_train,
+               family = "binomial")
+```
+
+### Results
+
+```{r}
+summary(logistic)
+```
+
+A lot of features are non-significant in this model (including job, marital, education, previous, cons.price.idx and euribor3m). In a second time, we'll drop those features in order to build a more parsimonious model.
+
+### Features importance
+
+```{r}
+fun_imp_ggplot_split(logistic)
+```
+
+In line with what was said just before, a lot of variables don't show enough importance to the model. This first regression model can be tuned to be more parsimonious.
+
+### Predicted scores
+
+Let's obtain the predicted scores for both datasets. The training scores are useful to evaluate how well did the training go and the validation scores (test scores) will be used to validate the model (cross-validation).
+
+```{r, message=F, warning=F}
+logistic_train_score = predict(logistic,
+                               newdata = bank_train,
+                               type = "response")
+
+logistic_test_score = predict(logistic,
+                              newdata = bank_test,
+                              type = "response")
+```
+
+### Cut identification
+
+Let's see if the default threshold (0.5) is appropriate with our scores. But first, we need to figure out which metric we should use to evaluate the model's performance.
+
+Since we've unbalanced data, it's easy to reach a huge accuracy score. Indeed, even the idiotic model which predicts the prevalent group for every observation will have a nice accuracy score. What's interesting is to predict correctly customers that are actually willing to subscribe to a term-deposit (True positive). Contacting a customer that isn't ready to subscribe (False positive) to it is bad, but it isn't as bad as skipping a potential customer (False negative). This will still cost time and money to the banks. So we want to focus on True positive rate, while having a reasonably low false positive rate.
+
+Recall is the ratio of the correctly positive labeled people among people who are willing to subscribe in reality and Precision is the ratio of the correctly positive labeled people among all the positive labeled people. We want to have high scores for both rates. The F1 score (or F score) is fitting perfectly to our situation. It's the harmonic average of the precision and recall. This is what we're going to focus on, while keeping an eye to the accuracy rate.
+
+```{r}
+measure_train = fun_gg_cutoff(logistic_train_score, bank_train$y, 
+                              "acc", "f")
+measure_train +
+  geom_vline(xintercept = c(0.2, 0.5), 
+             linetype = "dashed")
+```
+
+This plot shows the evolution of the accuracy and F1 rates according to the cut level. As it was said earlier, we want to have a good F1 score without dropping to much on accuracy. The 0.2 cut seems a good settlement, the trade-off between accuracy and F1 score is fair enough.
+
+### Confusion matrix - train data
+
+Let's draw out the confusion matrix with the 0.2 cut.
+
+```{r}
+logistic_train_cut = 0.2
+logistic_train_class = fun_cut_predict(logistic_train_score, logistic_train_cut)
+# matrix
+logistic_train_confm = confusionMatrix(logistic_train_class, bank_train$y, 
+                                       positive = "1",
+                                       mode = "everything")
+logistic_train_confm
+```
+
+On the training set, the accuracy reachs 86.58% and the Sensitivity rate is close to 56.54%, which means that model manages to correctly label 86.58% of the times and 56.54% of the willingful customers are correctly detected. Let's evaluate this with the hold out data.
+
+### Validation (cut cost and confusion matrix)
+
+```{r}
+measure_test = fun_gg_cutoff(logistic_test_score, bank_test$y, 
+                             "acc", "f")
+measure_test +
+  geom_vline(xintercept = c(logistic_train_cut, 0.5), 
+             linetype = "dashed")
+```
+
+```{r}
+logistic_test_class = fun_cut_predict(logistic_test_score, logistic_train_cut)
+# matrix
+logistic_test_confm = confusionMatrix(logistic_test_class, bank_test$y, 
+                                      positive = "1",
+                                      mode = "everything")
+logistic_test_confm
+```
+
+The performance values are close to the training ones, our model doesn't suffer from over-fitting.
+
+Let's apply the same procedure with other models.
+
+
+
+## Logistic regression 2 (simple)
+
+We've find out that some features weren't relevant to our model, so let's drop those and remake a logistic regression.
+
+```{r}
+logistic_2 = glm(y ~ . - job - marital - education - previous - euribor3m - cons.conf.idx - campaign,
+                 data = bank_train,
+                 family = "binomial")
+```
+
+### Results
+
+```{r}
+summary(logistic_2)
+```
+
+This model seems as good as the previous one (according to the AIC), but with way lesser predictors.
+
+
+### Features importance
+
+```{r}
+fun_imp_ggplot_split(logistic_2)
+```
+
+Every feature is now revelant to the model.
+
+### Predicted scores
+
+Same as before, we compute scores to evaluate and validate our model.
+
+```{r}
+logistic_train_score_2 = predict(logistic_2,
+                                 newdata = bank_train,
+                                 type = "response")
+
+logistic_test_score_2 = predict(logistic_2,
+                                newdata = bank_test,
+                                type = "response")
+```
+
+### Cut identification
+
+```{r}
+measure_train_2 = fun_gg_cutoff(logistic_train_score_2, bank_train$y, 
+                                "acc", "f")
+measure_train_2 +
+  geom_vline(xintercept = c(0.2, 0.5), 
+             linetype = "dashed")
+```
+
+The 0.2 threshold remains appropriate and is very close to the best cut for maximizing the F1 score.
+
+### Confusion matrix - train data
+
+```{r}
+logistic_train_cut_2 = 0.2
+logistic_train_class_2 = fun_cut_predict(logistic_train_score_2, logistic_train_cut_2)
+# matrix
+logistic_train_confm_2 = confusionMatrix(logistic_train_class_2, bank_train$y, 
+                                         positive = "1",
+                                         mode = "everything")
+logistic_train_confm_2
+```
+
+The accuracy slightly decreased but the sensitivity rate also slightly increased. Let's directly study the validation set.
+
+### Validation (cut cost and confusion matrix)
+
+```{r}
+measure_test_2 = fun_gg_cutoff(logistic_test_score_2, bank_test$y, 
+                               "acc", "f")
+measure_test_2 +
+  geom_vline(xintercept = c(logistic_train_cut_2, 0.5), 
+             linetype = "dashed")
+```
+
+```{r}
+logistic_test_class_2 = fun_cut_predict(logistic_test_score_2, logistic_train_cut_2)
+# matrix
+logistic_test_confm_2 = confusionMatrix(logistic_test_class_2, bank_test$y, 
+                                        positive = "1",
+                                        mode = "everything")
+logistic_test_confm_2
+```
+
+At the end, the second logistic regression performs almost as good as the first model, but since we're seeking of high sensitivity rate, this little increase is welcome.
+
+
+
+
+
+
+## Decision Tree
+
+We'll build up a decision tree by tuning the complexity parameter (cp) parameter.
+
+```{r}
+modelLookup("rpart")
+```
+
+
+```{r, message=F, warning=F}
+tune_grid = expand.grid(
+  cp = seq(from = 0, to = 0.01, by = 0.001)
+)
+
+tune_control = trainControl(
+  method = "cv", # cross-validation
+  number = 3, # with n folds 
+  summaryFunction = prSummary,
+  verboseIter = FALSE, # no training log
+  allowParallel = FALSE # FALSE for reproducible results 
+)
+
+rpart1_tune = train(
+  y ~ .,
+  data = bank_data,
+  metric = "F",
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "rpart"
+)
+
+ggplot(rpart1_tune) +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+tree = rpart(y ~ .,
+             data = bank_train,
+             cp = rpart1_tune$bestTune)
+```
+
+
+```{r}
+rpart.plot(tree)
+```
+
+### Features importance
+
+```{r}
+fun_imp_ggplot_split(tree)
+```
+
+For the same reasons as before, we'll build another tree with lesser features in the next section.
+
+### Predicted scores
+
+```{r}
+tree_train_score = predict(tree,
+                           newdata = bank_train,
+                           type = "prob")[, 2]
+
+tree_test_score = predict(tree,
+                          newdata = bank_test,
+                          type = "prob")[, 2]
+```
+
+### Cut identification
+
+```{r}
+measure_train = fun_gg_cutoff(tree_train_score, bank_train$y, 
+                              "acc", "f")
+measure_train +
+  geom_vline(xintercept = c(0.25, 0.5), 
+             linetype = "dashed")
+```
+
+### Confusion matrix - train data
+
+
+```{r}
+tree_train_cut = 0.25
+tree_train_class = fun_cut_predict(tree_train_score, tree_train_cut)
+tree_train_confm = confusionMatrix(tree_train_class, bank_train$y, 
+                                   positive = "1",
+                                   mode = "everything")
+tree_train_confm
+```
+
+The tree model is more accurate (around plus 2 percentage points) than the logistic ones on the training set, but its sensitivity has dropped (around minus 10 percentage points).
+
+### Validation (cut cost and confusion matrix)
+
+
+```{r}
+measure_test = fun_gg_cutoff(tree_test_score, bank_test$y, 
+                             "acc", "f")
+measure_test +
+  geom_vline(xintercept = c(tree_train_cut, 0.5), 
+             linetype = "dashed")
+```
+
+```{r}
+tree_test_class = fun_cut_predict(tree_test_score, tree_train_cut)
+# matrix
+tree_test_confm = confusionMatrix(tree_test_class, bank_test$y, 
+                                  positive = "1",
+                                  mode = "everything")
+tree_test_confm
+```
+
+
+
+## Random Forest (ranger)
+
+```{r}
+modelLookup("ranger")
+```
+
+The random forest has 3 parameters to tune.
+
+```{r, warning=F, message=F}
+tune_grid = expand.grid(
+  mtry = c(1:(floor(ncol(bank_data) * 0.7))),
+  splitrule = c("gini", "extratrees"),
+  min.node.size = 1
+)
+
+tune_control = trainControl(
+  method = "cv", # cross-validation
+  number = 3, # with n folds 
+  summaryFunction = prSummary,
+  verboseIter = FALSE, # no training log
+  allowParallel = FALSE # FALSE for reproducible results 
+)
+
+ranger_tune = train(
+  y ~ .,
+  data = bank_data,
+  metric = "F",
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "ranger"
+)
+
+ggplot(ranger_tune) +
+  theme(legend.position = "bottom")
+```
+
+
+
+
+
+```{r}
+rf = ranger(y ~ .,
+            data = bank_train,
+            num.trees = 1000,
+            importance = "impurity",
+            splitrule = ranger_tune$bestTune$splitrule,
+            mtry = ranger_tune$bestTune$mtry,
+            min.node.size = ranger_tune$bestTune$min.node.size,
+            write.forest = T,
+            probability = T)
+```
+
+
+### Results
+
+```{r}
+print(rf)
+```
+
+### Features importance
+
+```{r}
+fun_imp_ggplot_split(rf)
+```
+
+### Predicted scores
+
+```{r}
+rf_train_score = predict(rf,
+                         data = bank_train)$predictions[, 2]
+
+rf_test_score = predict(rf,
+                        data = bank_test)$predictions[, 2]
+```
+
+### Cut identification
+
+```{r}
+measure_train = fun_gg_cutoff(rf_train_score, bank_train$y, 
+                              "acc", "f")
+measure_train +
+  geom_vline(xintercept = c(0.3, 0.5), 
+             linetype = "dashed")
+```
+
+### Confusion matrix - train data
+
+```{r}
+rf_train_cut = 0.3
+rf_train_class = fun_cut_predict(rf_train_score, rf_train_cut)
+# matrix
+rf_train_confm = confusionMatrix(rf_train_class, bank_train$y, 
+                                 positive = "1",
+                                 mode = "everything")
+rf_train_confm
+```
+
+### Validation (cut cost and confusion matrix)
+
+
+```{r}
+measure_test = fun_gg_cutoff(rf_test_score, bank_test$y, 
+                             "acc", "f")
+measure_test +
+  geom_vline(xintercept = c(rf_train_cut, 0.5), 
+             linetype = "dashed")
+```
+
+```{r}
+rf_test_class = fun_cut_predict(rf_test_score, rf_train_cut)
+# matrix
+rf_test_confm = confusionMatrix(rf_test_class, bank_test$y, 
+                                positive = "1",
+                                mode = "everything")
+rf_test_confm
+```
+
+## Light GBM
+
+Light GBM isn't supported by caret package yet, so it'll use default parameters.
+
+```{r}
+bank_train_X_lgb = as.matrix(lgb.prepare_rules(bank_train %>% 
+                                                 select(-y))[[1]])
+bank_test_X_lgb = as.matrix(lgb.prepare_rules(bank_test %>% 
+                                                select(-y))[[1]])
+bank_train_Y_lgb = as.matrix(bank_train %>%
+                               select(y) %>% 
+                               mutate(y = as.numeric(as.character(y))))
+bank_test_Y_lgb = as.matrix(bank_test %>%
+                              select(y) %>% 
+                              mutate(y = as.numeric(as.character(y))))
+
+bank_train_lgb = lgb.Dataset(bank_train_X_lgb, 
+                             label = bank_train_Y_lgb)
+bank_test_lgb = lgb.Dataset(bank_test_X_lgb, 
+                            label = bank_test_Y_lgb)
+
+params_lgb = list(
+  objective = "binary", # type of exercise
+  metric = "auc", # metric to be evaluated 
+  num_iterations = 500, # number of boosting iterations
+  early_stopping_rounds = 200, # ill stop training if one metric of one validation data doesn't improve
+  learning_rate = 0.1, # shrinkage rate
+  max_depth = 4, # max depth for tree model (used to deal with over-fitting when data is small)
+  num_leaves = 7, # max number of leaves (nodes) in one tree
+  # scale_pos_weight = (1 - table(bank_train$y)[[2]]/length(bank_train$y)) * 100, # weight for positive class
+  is_unbalance = T,
+  min_data_in_leaf = 10, # min number of data in one leaf (used to deal with over-fitting)
+  feature_fraction = 0.9, # randomly select part of the features on each iteration
+  bagging_fraction = 0.9, # randomly select part of the data without resampling
+  bagging_freq = 1, # if != 0, enables bagging, performs bagging at every k iteration
+  num_threads = 6 # number of cpu cores (not threads) to use
+)
+
+lgb <- lgb.train(
+  params = params_lgb,
+  data = bank_train_lgb,
+  valids = list(train = bank_train_lgb, 
+                test = bank_test_lgb),
+  verbose = 1, # show results?
+  eval_freq = 50 # show metric every how many iterations?
+)
+```
+
+### Predicted scores
+
+```{r}
+lgb_train_score = predict(lgb,
+                          data = bank_train_X_lgb,
+                          n = lgb$best_iter)
+
+lgb_test_score = predict(lgb,
+                         data = bank_test_X_lgb,
+                         n = lgb$best_iter)
+```
+
+### Cut identification
+
+```{r}
+measure_train = fun_gg_cutoff(lgb_train_score, bank_train_Y_lgb, 
+                              "acc", "f")
+measure_train +
+  geom_vline(xintercept = c(0.75, 0.5), 
+             linetype = "dashed")
+```
+
+
+### Confusion matrix - train data
+
+
+```{r}
+lgb_train_cut = 0.75
+lgb_train_class = fun_cut_predict(lgb_train_score, lgb_train_cut)
+lgb_train_confm = confusionMatrix(lgb_train_class, bank_train$y, 
+                                  positive = "1",
+                                  mode = "everything")
+lgb_train_confm
+```
+
+### Validation (cut cost and confusion matrix)
+
+
+```{r}
+measure_test = fun_gg_cutoff(lgb_test_score, bank_test_Y_lgb, 
+                             "acc", "f")
+measure_test +
+  geom_vline(xintercept = c(lgb_train_cut, 0.5), 
+             linetype = "dashed")
+```
+
+```{r}
+lgb_test_class = fun_cut_predict(lgb_test_score, lgb_train_cut)
+lgb_test_confm = confusionMatrix(lgb_test_class, bank_test$y, 
+                                 positive = "1",
+                                 mode = "everything")
+lgb_test_confm
+```
+
+
+
+
+
+
+## XGBoost
+
+```{r}
+modelLookup("xgbTree")
+```
+
+XGBoost has 7 parameters to tune. Tuning all those parameters at the same time will take a lot of time. We'll follow the step-by-step tuning suggested by Pelkoja (https://www.kaggle.com/pelkoja/visual-xgboost-tuning-with-caret/code).
+
+```{r, warning=F, message=F}
+bank_X = as.matrix(lgb.prepare_rules(bank_data %>% 
+                                       select(-y))[[1]])
+bank_Y = bank_data$y
+
+nrounds = 1000
+
+tune_grid = expand.grid(
+  nrounds = seq(from = 200, to = nrounds, by = 50),
+  eta = c(0.025, 0.05, 0.1, 0.3),
+  max_depth = c(2, 3, 4, 5, 6),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+tune_control = trainControl(
+  method = "cv", # cross-validation
+  number = 3, # with n folds 
+  summaryFunction = prSummary,
+  verboseIter = FALSE, # no training log
+  allowParallel = FALSE # FALSE for reproducible results 
+)
+
+xgb_tune = train(
+  x = bank_X,
+  y = bank_Y,
+  metric = "F",
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = FALSE
+)
+
+ggplot(xgb_tune) +
+  theme(legend.position = "bottom")
+```
+
+
+
+```{r, warning=F, message=F}
+tune_grid2 = expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = xgb_tune$bestTune$eta,
+  max_depth = ifelse(xgb_tune$bestTune$max_depth == 2,
+                     c(xgb_tune$bestTune$max_depth:4),
+                     (xgb_tune$bestTune$max_depth - 1):(xgb_tune$bestTune$max_depth + 1)),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = c(1, 2, 3),
+  subsample = 1
+)
+
+xgb_tune2 = train(
+  x = bank_X,
+  y = bank_Y,
+  trControl = tune_control,
+  tuneGrid = tune_grid2,
+  metric = "F",
+  method = "xgbTree",
+  verbose = FALSE
+)
+
+ggplot(xgb_tune2) +
+  theme(legend.position = "bottom")
+```
+
+```{r, message=F, warning=F}
+tune_grid3 = expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = xgb_tune$bestTune$eta,
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = 0,
+  colsample_bytree = c(0.4, 0.6, 0.8, 1.0),
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = c(0.5, 0.75, 1.0)
+)
+
+xgb_tune3 = train(
+  x = bank_X,
+  y = bank_Y,
+  trControl = tune_control,
+  tuneGrid = tune_grid3,
+  metric = "F",
+  method = "xgbTree",
+  verbose = FALSE
+)
+
+ggplot(xgb_tune3) +
+  theme(legend.position = "bottom")
+```
+
+
+```{r, message=F, warning=F}
+tune_grid4 = expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = xgb_tune$bestTune$eta,
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = c(0, 0.05, 0.1, 0.5, 0.7, 0.9, 1.0),
+  colsample_bytree = xgb_tune3$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = xgb_tune3$bestTune$subsample
+)
+
+xgb_tune4 = train(
+  x = bank_X,
+  y = bank_Y,
+  trControl = tune_control,
+  tuneGrid = tune_grid4,
+  metric = "F",
+  method = "xgbTree",
+  verbose = FALSE
+)
+
+ggplot(xgb_tune4) +
+  theme(legend.position = "bottom")
+```
+
+
+```{r, message=F, warning=F}
+tune_grid5 = expand.grid(
+  nrounds = seq(from = 100, to = 2000, by = 100),
+  eta = c(0.01, 0.015, 0.025, 0.05, 0.1),
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = xgb_tune4$bestTune$gamma,
+  colsample_bytree = xgb_tune3$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = xgb_tune3$bestTune$subsample
+)
+
+xgb_tune5 = train(
+  x = bank_X,
+  y = bank_Y,
+  trControl = tune_control,
+  tuneGrid = tune_grid5,
+  metric = "F",
+  method = "xgbTree",
+  verbose = FALSE
+)
+
+ggplot(xgb_tune5) +
+  theme(legend.position = "bottom")
+```
+
+
+Now've every tuned hyperparameter.
+
+```{r}
+xgb_tune5$bestTune
+```
+
+Let's build our model.
+
+
+```{r}
+bank_train_X_xgb = as.matrix(lgb.prepare_rules(bank_train %>% 
+                                                 select(-y))[[1]])
+bank_test_X_xgb = as.matrix(lgb.prepare_rules(bank_test %>% 
+                                                select(-y))[[1]])
+bank_train_Y_xgb = as.matrix(bank_train %>%
+                               select(y) %>% 
+                               mutate(y = as.numeric(as.character(y))))
+bank_test_Y_xgb = as.matrix(bank_test %>%
+                              select(y) %>% 
+                              mutate(y = as.numeric(as.character(y))))
+
+bank_train_xgb = xgb.DMatrix(bank_train_X_xgb, 
+                             label = bank_train_Y_xgb)
+bank_test_xgb = xgb.DMatrix(bank_test_X_xgb, 
+                            label = bank_test_Y_xgb)
+
+params_xgb = list(
+  nthreads = 10, # parallel threads used
+  booster = "gbtree",
+  eval_metric = "aucpr",
+  learning_rate = xgb_tune5$bestTune$eta, # shrinkage rate
+  max_depth = xgb_tune5$bestTune$max_depth, # max depth for trees
+  subsample = xgb_tune5$bestTune$subsample, # subsample ratio per iteration
+  colsample_bytree = xgb_tune5$bestTune$colsample_bytree, # sample of features per iteration
+  min_child_weight = xgb_tune5$bestTune$min_child_weight
+)
+
+xgb <- xgb.train(
+  params = params_xgb,
+  data = bank_train_xgb,
+  watchlist = list(train = bank_train_xgb, 
+                   test = bank_test_xgb), # test as second data for xvalidation purposes
+  nrounds = xgb_tune5$bestTune$nrounds,
+  verbose = T,
+  print_every_n = 25,
+  maximize = T,
+  early_stopping_rounds = xgb_tune5$bestTune$nrounds
+)
+```
+
+### Predicted scores
+
+```{r}
+xgb_train_score = predict(xgb,
+                          newdata = bank_train_X_xgb,
+                          ntreelimit = xgb$best_iteration)
+
+xgb_test_score = predict(xgb,
+                         newdata = bank_test_X_xgb,
+                         ntreelimit = xgb$best_iteration)
+```
+
+### Cut identification
+
+```{r}
+measure_train = fun_gg_cutoff(xgb_train_score, bank_train_Y_xgb, 
+                              "acc", "f")
+measure_train +
+  geom_vline(xintercept = c(0.3, 0.5), 
+             linetype = "dashed")
+```
+
+
+### Confusion matrix - train data
+
+
+```{r}
+xgb_train_cut = 0.3
+xgb_train_class = fun_cut_predict(xgb_train_score, xgb_train_cut)
+xgb_train_confm = confusionMatrix(xgb_train_class, bank_train$y, 
+                                  positive = "1",
+                                  mode = "everything")
+xgb_train_confm
+```
+
+### Validation (cut cost and confusion matrix)
+
+
+```{r}
+measure_test = fun_gg_cutoff(xgb_test_score, bank_test_Y_xgb, 
+                             "acc", "f")
+measure_test +
+  geom_vline(xintercept = c(xgb_train_cut, 0.5), 
+             linetype = "dashed")
+```
+
+```{r}
+xgb_test_class = fun_cut_predict(xgb_test_score, xgb_train_cut)
+xgb_test_confm = confusionMatrix(xgb_test_class, bank_test$y, 
+                                 positive = "1",
+                                 mode = "everything")
+xgb_test_confm
+```
+
+
+# Model selection
+
+Let's start by figuring out how the different models perform on training sets.
+
+## ROC and PR curves - train
+
+```{r}
+score_train = data.frame("logistic complex" = logistic_train_score,
+                         "logistic simple" = logistic_train_score_2,
+                         "tree complex" = tree_train_score,
+                         "random forest" = rf_train_score,
+                         "light gbm" = lgb_train_score,
+                         "xgboost" = xgb_train_score,
+                         "obs" = as.numeric(bank_train$y) - 1)
+
+
+roc_train = score_train %>%
+  gather(key = "Method", value = "score", -obs) %>% 
+  ggplot() +
+  aes(d = obs,
+      m = score,
+      color = Method) +
+  geom_roc(labels = F, pointsize = 0, size = 0.6) +
+  xlab("Specificity") +
+  ylab("Sensitivity") +
+  ggtitle("ROC Curve", subtitle = "Train dataset")
+
+prcurve_train = gg_prcurve(score_train) + ggtitle("PR Curve", subtitle = "Train dataset")
+
+curves_train = ggarrange(roc_train, prcurve_train, 
+                         common.legend = T,
+                         legend = "bottom")
+```
+
+```{r}
+print(curves_train)
+```
+
+
+## Prediction quality - train
+
+```{r, warning=F, message=F}
+data.frame("Model" = c("Logistic regression (complex)",
+                       "Logistic regression (simple)",
+                       "Decision tree",
+                       "Random forest (ranger)",
+                       "Light GBM (default)",
+                       "XGBoost"),
+           "AUROC" = c(auc(bank_train$y, logistic_train_score),
+                       auc(bank_train$y, logistic_train_score_2),
+                       auc(bank_train$y, tree_train_score),
+                       auc(bank_train$y, rf_train_score),
+                       auc(bank_train$y, lgb_train_score),
+                       auc(bank_train$y, xgb_train_score)),
+           "AUPR" = c(aucpr(bank_train$y, logistic_train_score),
+                      aucpr(bank_train$y, logistic_train_score_2),
+                      aucpr(bank_train$y, tree_train_score),
+                      aucpr(bank_train$y, rf_train_score),
+                      aucpr(bank_train$y, lgb_train_score),
+                      aucpr(bank_train$y, xgb_train_score)),
+           "Cut" = c(logistic_train_cut,
+                     logistic_train_cut_2,
+                     tree_train_cut,
+                     rf_train_cut,
+                     lgb_train_cut,
+                     xgb_train_cut),
+           "Accuracy" = c(logistic_train_confm[["overall"]][["Accuracy"]],
+                          logistic_train_confm_2[["overall"]][["Accuracy"]],
+                          tree_train_confm[["overall"]][["Accuracy"]],
+                          rf_train_confm[["overall"]][["Accuracy"]],
+                          lgb_train_confm[["overall"]][["Accuracy"]],
+                          xgb_train_confm[["overall"]][["Accuracy"]]),
+           "F1" = c(logistic_train_confm[["byClass"]][["F1"]],
+                    logistic_train_confm_2[["byClass"]][["F1"]],
+                    tree_train_confm[["byClass"]][["F1"]],
+                    rf_train_confm[["byClass"]][["F1"]],
+                    lgb_train_confm[["byClass"]][["F1"]],
+                    xgb_train_confm[["byClass"]][["F1"]]),
+           stringsAsFactors = F)
+```
+
+
+The random forest out-performs every other models on the training set. But this is worthless without validation from the test set.
+
+## ROC and PR curves - validation
+
+
+```{r}
+score_test = data.frame("logistic complex" = logistic_test_score,
+                        "logistic simple" = logistic_test_score_2,
+                        "tree complex" = tree_test_score,
+                        "random forest" = rf_test_score,
+                        "light gbm" = lgb_test_score,
+                        "xgboost" = xgb_test_score,
+                        "obs" = as.numeric(bank_test$y) - 1)
+
+
+roc_test = score_test %>%
+  gather(key = "Method", value = "score", -obs) %>% 
+  ggplot() +
+  aes(d = obs,
+      m = score,
+      color = Method) +
+  geom_roc(labels = F, pointsize = 0, size = 0.6) +
+  xlab("Specificity") +
+  ylab("Sensitivity") +
+  ggtitle("ROC Curve", subtitle = "Validation dataset")
+
+prcurve_test = gg_prcurve(score_test) + ggtitle("PR Curve", subtitle = "Validation dataset")
+
+curves_test = ggarrange(roc_test, prcurve_test, 
+                        common.legend = T,
+                        legend = "bottom")
+```
+
+```{r}
+print(curves_test)
+```
+
+The gap narrows alot with the validation set.
+
+
+## Prediction quality - validation
+
+```{r, warning=F, message=F}
+df_final = data.frame("Model" = c("Logistic regression (complex)",
+                                  "Logistic regression (simple)",
+                                  "Decision tree",
+                                  "Random forest (ranger)",
+                                  "Light GBM (default)",
+                                  "XGBoost"),
+                      "AUROC" = c(auc(bank_test$y, logistic_test_score),
+                                  auc(bank_test$y, logistic_test_score_2),
+                                  auc(bank_test$y, tree_test_score),
+                                  auc(bank_test$y, rf_test_score),
+                                  auc(bank_test$y, lgb_test_score),
+                                  auc(bank_test$y, xgb_test_score)),
+                      "AUPR" = c(aucpr(bank_test$y, logistic_test_score),
+                                 aucpr(bank_test$y, logistic_test_score_2),
+                                 aucpr(bank_test$y, tree_test_score),
+                                 aucpr(bank_test$y, rf_test_score),
+                                 aucpr(bank_test$y, lgb_test_score),
+                                 aucpr(bank_test$y, xgb_test_score)),
+                      "Cut" = c(logistic_train_cut,
+                                logistic_train_cut_2,
+                                tree_train_cut,
+                                rf_train_cut,
+                                lgb_train_cut,
+                                xgb_train_cut),
+                      "Accuracy" = c(logistic_test_confm[["overall"]][["Accuracy"]],
+                                     logistic_test_confm_2[["overall"]][["Accuracy"]],
+                                     tree_test_confm[["overall"]][["Accuracy"]],
+                                     rf_test_confm[["overall"]][["Accuracy"]],
+                                     lgb_test_confm[["overall"]][["Accuracy"]],
+                                     xgb_test_confm[["overall"]][["Accuracy"]]),
+                      "F1" = c(logistic_test_confm[["byClass"]][["F1"]],
+                               logistic_test_confm_2[["byClass"]][["F1"]],
+                               tree_test_confm[["byClass"]][["F1"]],
+                               rf_test_confm[["byClass"]][["F1"]],
+                               lgb_test_confm[["byClass"]][["F1"]],
+                               xgb_test_confm[["byClass"]][["F1"]]),
+                      stringsAsFactors = F)
+df_final %>% 
+  arrange(-F1)
+```
+
+According to the F1 score, the XGBoost model is the best for our dataset. Let's look in detail what are the predictions.
+
+```{r}
+xgb_test_confm
+```
+
+The XGBoost model has an accuracy close to `r as.numeric(100*xgb_test_confm$overall["Accuracy"])`%. As a reminder, the test set has 88.57% of "y = 0", so the idiotic model which always predicts "0" has an accuracy of 88.57%, which is better than our model, but this isn't an issue. We've decided to focus on the F1 score, to have a good rate of True Positive.
+
+The Sensitivity/Recall reachs `r as.numeric(100*xgb_test_confm$byClass["Sensitivity"])`%, which means that of all the clients who are willing to subscribe to a term deposit, the model managed to predict a little more than half of them.
+
+The Precision reachs `r as.numeric(100*xgb_test_confm$byClass["Precision"])`%, which means that half of those who've been labeled by "1" are actually willing to subscribe to a term deposit. In other words, one contacted person out of two in average will lead to a subscription. The other half won't be a waste because 
+
+<hr>
+
+**This is my first machine learning code, after learning from existing kaggle kernels. Let me know if you have any questions or comments. If you have any suggestion or corrections to make, please do not hesitate to let me know.**
+
+<hr>
+
